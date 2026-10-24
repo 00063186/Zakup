@@ -94,6 +94,7 @@ def build_plan():
             "name_ru":      p.get("name_ru"),
             "name_kz":      p.get("name_kz"),
             "desc_ru":      p.get("desc_ru"),
+            "desc_kz":      p.get("desc_kz"),
             "quantity":     p.get("count"),
             "price":        p.get("price"),
             "amount":       p.get("amount"),
@@ -101,6 +102,10 @@ def build_plan():
             "subject_type": p.get("ref_subject_type_id"),
             "is_deleted":   p.get("is_deleted"),
             "date_create":  p.get("date_create"),
+            "plan_act_id":      p.get("plan_act_id"),
+            "plan_preliminary": p.get("plan_preliminary"),
+            "is_active":        p.get("is_active"),
+            "date_approved":    p.get("date_approved"),
         })
         for k in p.get("kato") or []:
             delivery.append({
@@ -113,6 +118,14 @@ def build_plan():
 
     plan_items = (pd.DataFrame(rows).sort_values("source")  # 'plan' бірінші
                   .drop_duplicates("plan_id", keep="first"))
+    df = plan_items
+    df["is_current"] = False
+    cand = df[(df.is_active == 1) & (df.is_deleted.fillna(0) == 0)]
+    cand = cand.assign(_prelim=cand.plan_preliminary.fillna(0))
+    best = (cand.sort_values(["root_id", "_prelim", "plan_id"],
+                             ascending=[True, True, False])
+                .drop_duplicates("root_id"))
+    df.loc[best.index, "is_current"] = True
     save(plan_items, "plan_items")
     save(pd.DataFrame(delivery), "plan_delivery")
 
