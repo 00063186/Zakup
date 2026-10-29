@@ -95,6 +95,9 @@ def build_plan():
             "name_kz":      p.get("name_kz"),
             "desc_ru":      p.get("desc_ru"),
             "desc_kz":      p.get("desc_kz"),
+            "extra_desc_ru":    p.get("extra_desc_ru"),
+            "extra_desc_kz":    p.get("extra_desc_kz"),
+            "justification_id": p.get("ref_justification_id"),
             "quantity":     p.get("count"),
             "price":        p.get("price"),
             "amount":       p.get("amount"),
@@ -161,6 +164,11 @@ def build_announcements():
         "itogi_date":      col(tb, "itogi_date_public"),
     })
     df["year"] = pd.to_numeric(df.publish_date.astype(str).str[:4], errors="coerce").astype("Int64")
+    lots = pd.read_sql("SELECT trd_buy_id, customer_bin FROM lots", clean)
+    lots = lots.dropna().drop_duplicates()
+    single = lots.groupby("trd_buy_id").filter(lambda x: len(x) == 1)
+    from_lots = df.trd_buy_id.map(dict(zip(single.trd_buy_id, single.customer_bin)))
+    df["customer_bin"] = df.customer_bin.replace("", None).combine_first(from_lots)
     save(df, "announcements")
 
 
@@ -173,6 +181,13 @@ def build_lots():
     def first_kato(lst):
         lst = [k for k in (lst or []) if k and str(k) != "0"]
         return str(lst[0]) if lst else None
+
+    def single_code(v):
+        try:
+            lst = json.loads(v) if isinstance(v, str) else v
+            return str(lst[0]) if isinstance(lst, list) and len(lst) == 1 else None
+        except Exception:
+            return None
 
     df = pd.DataFrame({
         "lot_id":         lt["id"],
@@ -190,6 +205,7 @@ def build_lots():
         "dumping":        col(lt, "dumping"),
         "kato_code":      col(lt, "pln_point_kato_list").map(first_kato),
         "point_list":     col(lt, "point_list").map(json.dumps),
+        "enstru_code":    col(lt, "enstru_list").map(single_code)
     })
     df["region_code"] = df.kato_code.map(to_region)
     ok = (df.quantity > 0) & (df.is_union == 0)
@@ -230,7 +246,8 @@ def build_contracts():
         "end_date":          col(ct, "contract_end_date"),
         "deleted":           col(ct, "deleted"),
     })
-    df["is_single_source"] = (pd.to_numeric(df.trd_buy_id, errors="coerce").fillna(0) == 0).astype(int)
+    df["is_single_source"] = (df.fact_trade_method.fillna("")
+                              .str.startswith("Из одного источника")).astype(int)
     df["year"] = pd.to_numeric(df.crdate.astype(str).str[:4], errors="coerce").astype("Int64")
 
     # Әр root_id бойынша ең соңғы (ID-і ең үлкен) өшірілмеген нұсқа
@@ -261,13 +278,17 @@ def build_contract_lines():
 
     # Жоспар тармағы: тікелей сілтеме
     p = pd.read_sql("""SELECT plan_id, root_id, source AS plan_source, enstru_code, unit_code,
-                              name_ru AS item_name_ru, name_kz AS item_name_kz
+                              name_ru AS item_name_ru, name_kz AS item_name_kz,
+                              desc_ru AS item_desc_ru, extra_desc_ru AS item_extra_desc_ru,
+                              is_current
                        FROM plan_items""", clean)
     p["plan_id"] = to_int(p.plan_id)
     p["root_id"] = to_int(p.root_id)
-    u = u.merge(p.drop(columns="root_id"), left_on="pln_point_id", right_on="plan_id", how="left")
+    p_attr = p.drop(columns=["root_id", "is_current"])                     # ӨЗГЕРДІ
+    u = u.merge(p_attr, left_on="pln_point_id", right_on="plan_id", how="left")
 
-    attrs = ["enstru_code", "unit_code", "item_name_ru", "item_name_kz"]
+    attrs = ["enstru_code", "unit_code", "item_name_ru", "item_name_kz",
+             "item_desc_ru", "item_extra_desc_ru"]
 
     def fill_plan(mask, src, label):
         u.loc[mask, "plan_id"] = src.plan_id.values
@@ -275,31 +296,41 @@ def build_contract_lines():
             u.loc[mask, a] = src[a].values
         u.loc[mask, "plan_source"] = label
 
-    # Өшірілген тармақтың жаңа нұсқасы: root_id = ескі ID
-    by_root = (p[p.plan_source == "plan"].dropna(subset=["root_id"])
-               .sort_values("plan_id").drop_duplicates("root_id", keep="last")
-               .set_index("root_id"))
+    # Өшірілген тармақтың ағымдағы нұсқасы: root_id = ескі ID
+    by_root = (p[p.is_current == 1].dropna(subset=["root_id"])            # ӨЗГЕРДІ
+               .drop_duplicates("root_id").set_index("root_id"))
     m = u.plan_id.isna() & u.pln_point_id.isin(by_root.index)
     fill_plan(m, by_root.loc[u.loc[m, "pln_point_id"]], "plan_root")
 
-    # Лоттың point_list арқылы: тек ЕНС ТРУ мен бірлігі бірдей лоттар
-    lots = pd.read_sql("SELECT lot_id, region_code AS lot_region, point_list FROM lots", clean)
+    # Лоттар бір рет оқылады: өңір, point_list және ЕНС ТРУ коды          # ӨЗГЕРДІ
+    lots = pd.read_sql("""SELECT lot_id, region_code AS lot_region, point_list,
+                                 enstru_code AS lot_enstru FROM lots""", clean)
     lots["lot_id"] = to_int(lots.lot_id)
+    lots = lots.drop_duplicates("lot_id")
+
+    # Лоттың point_list арқылы: тек ЕНС ТРУ мен бірлігі бірдей лоттар
     ex = (lots[["lot_id"]].assign(pid=lots.point_list.astype(str).str.findall(r"\d+"))
           .explode("pid").dropna(subset=["pid"]))
     ex["pid"] = to_int(ex.pid)
-    li = ex.merge(p, left_on="pid", right_on="plan_id")
+    li = ex.merge(p_attr, left_on="pid", right_on="plan_id")
     g = li.groupby("lot_id").agg(n_e=("enstru_code", "nunique"), n_u=("unit_code", "nunique"),
                                  plan_id=("plan_id", "max"))
     good = g[(g.n_e == 1) & (g.n_u == 1)]
     lot_src = (good[["plan_id"]].reset_index()
-               .merge(p.drop(columns="root_id"), on="plan_id").set_index("lot_id"))
+               .merge(p_attr, on="plan_id").set_index("lot_id"))
     m = u.plan_id.isna() & u.lot_id.isin(lot_src.index)
     fill_plan(m, lot_src.loc[u.loc[m, "lot_id"]].reset_index(), "lot_points")
 
+    # Жоспар табылмаған жолдарға ЕНС ТРУ кодын лоттан аламыз (бірлік бос қалады)
+    u["enstru_source"] = u.enstru_code.notna().map({True: "plan", False: None})
+    u = u.merge(lots[["lot_id", "lot_region", "lot_enstru"]], on="lot_id", how="left")  # ӨЗГЕРДІ
+    fill = u.enstru_code.isna() & u.lot_enstru.notna()
+    u.loc[fill, "enstru_code"] = u.loc[fill, "lot_enstru"]
+    u.loc[fill, "enstru_source"] = "lot"
+    u = u.drop(columns="lot_enstru")
+
     # Өңір: лот → жоспардың жалғыз жеткізу өңірі → тапсырыс берушінің мекенжайы
-    u = u.merge(lots[["lot_id", "lot_region"]].drop_duplicates("lot_id"), on="lot_id", how="left")
-    u["lot_region"] = u.lot_region.map(to_region)
+    u["lot_region"] = u.lot_region.map(to_region)                          # ӨЗГЕРДІ: қайта merge жоқ
 
     d = pd.read_sql("SELECT plan_id, region_code FROM plan_delivery", clean)
     d["plan_id"] = to_int(d.plan_id)
@@ -330,7 +361,7 @@ def build_contract_lines():
         "line_id", "root_id", "contract_id", "trd_buy_id", "lot_id", "plan_id", "plan_source",
         "customer_bin", "supplier_bin", "year", "sign_date", "status",
         "fact_trade_method", "is_single_source",
-        "enstru_code", "unit_code", "item_name_ru", "item_name_kz",
+        "enstru_code", "enstru_source", "unit_code", "item_name_ru", "item_name_kz", "item_desc_ru", "item_extra_desc_ru",
         "quantity", "unit_price", "unit_price_with_vat", "total_sum", "fact_sum", "executed",
         "region_code", "region_source", "price_valid"]]
     save(out, "contract_lines")
@@ -388,7 +419,7 @@ def main():
 
     start = time.time()
     steps = [("Анықтамалықтар", build_refs), ("Жоспар", build_plan),
-             ("Хабарландырулар", build_announcements), ("Лоттар", build_lots),
+             ("Лоттар", build_lots), ("Хабарландырулар", build_announcements),
              ("Шарттар", build_contracts)]
     for title, fn in steps:
         print(f"\n[{title}]")
